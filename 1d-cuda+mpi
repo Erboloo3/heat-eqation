@@ -1,0 +1,222 @@
+#include <fstream>
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <iomanip>
+#include <chrono>
+#include <cuda_runtime.h>
+#include "device_launch_parameters.h"
+#include <mpi.h>
+#include <fstream>
+
+#define M_PI 3.14159265358979323846
+
+using namespace std;
+using namespace std::chrono;
+
+double exact_solution(double x, double t) {
+    double sum = 0.0;
+    for (int n = 1; n <= 1; n++) {
+        sum += (1.0 / pow(n * M_PI, 3)) * sin(n * M_PI * x) * exp(-pow(n * M_PI, 2) * t);
+    }
+    return 8.0 * sum;
+}
+
+void print_table(const vector<double>& data, const string& title, int rank, int local_Nx) {
+    cout << "Rank " << rank << " - " << "--------------------------------------------------\n";
+    cout << "Rank " << rank << " - " << title << "\n";
+    cout << "Rank " << rank << " - Row 0 | ";
+    for (int j = 0; j < min(local_Nx + 1, 10); j++) {
+        cout << setw(8) << fixed << setprecision(3) << data[j] << " ";
+    }
+    cout << "\n";
+    cout << "Rank " << rank << " - " << "--------------------------------------------------\n";
+}
+
+__global__ void heat_equation_kernel(double* u_prev, double* u_curr, double r, int local_Nx, int offset) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int global_j = j + offset;
+    if (j > 0 && j < local_Nx) {
+        u_curr[j] = u_prev[j] + r * (u_prev[j - 1] - 2.0 * u_prev[j] + u_prev[j + 1]);
+    }
+
+    if (global_j == 0 || global_j == local_Nx + offset - 1) {
+        u_curr[j] = 0.0;
+    }
+}
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+   
+    int Nx = 100000;
+    double Lx = 100.0;
+    double Lt = 0.025;
+    double r = 0.5;
+    double alpha = 1.0;
+    double dx = Lx / Nx;
+    double dt = r * dx * dx / alpha;
+    int Nt = static_cast<int>(ceil(Lt / dt));
+
+    if (r > 0.5 && rank == 0) {
+        cerr << "Error: Stability condition not met (r <= 0.5). r = " << r << endl;
+        MPI_Finalize();
+        return 1;
+    }
+    cout << "Nx: " << Nx << ", Nt: " << Nt << ", dx: " << dx << ", dt: " << dt << ", r: " << r << endl;
+
+    int local_Nx = Nx / size;
+    int remainder = Nx % size;
+    int offset = rank * local_Nx + min(rank, remainder);
+    if (rank < remainder) local_Nx++;
+
+   
+    vector<double> u_prev(local_Nx + 1, 0.0);
+    vector<double> u_curr(local_Nx + 1, 0.0);
+
+    
+    for (int j = 0; j <= local_Nx; j++) {
+        double x = (offset + j) * dx;
+        u_prev[j] = x * (1 - x);
+    }
+
+    if (offset == 0) u_prev[0] = 0;
+    if (offset + local_Nx == Nx) u_prev[local_Nx] = 0;
+
+    double* d_u_prev, * d_u_curr;
+    cudaError_t cudaStatus = cudaMalloc((void**)&d_u_prev, (local_Nx + 1) * sizeof(double));
+    if (cudaStatus != cudaSuccess) {
+        cerr << "Rank " << rank << " - cudaMalloc failed for d_u_prev: " << cudaGetErrorString(cudaStatus) << endl;
+        MPI_Finalize();
+        return 1;
+    }
+    cudaStatus = cudaMalloc((void**)&d_u_curr, (local_Nx + 1) * sizeof(double));
+    if (cudaStatus != cudaSuccess) {
+        cerr << "Rank " << rank << " - cudaMalloc failed for d_u_curr: " << cudaGetErrorString(cudaStatus) << endl;
+        cudaFree(d_u_prev);
+        MPI_Finalize();
+        return 1;
+    }
+
+    cudaStatus = cudaMemcpy(d_u_prev, u_prev.data(), (local_Nx + 1) * sizeof(double), cudaMemcpyHostToDevice);
+    if (cudaStatus != cudaSuccess) {
+        cerr << "Rank " << rank << " - cudaMemcpy failed for initial condition: " << cudaGetErrorString(cudaStatus) << endl;
+        cudaFree(d_u_prev);
+        cudaFree(d_u_curr);
+        MPI_Finalize();
+        return 1;
+    }
+
+    auto start = high_resolution_clock::now();
+
+    int blockSize = 32;
+    int numBlocks = (local_Nx + blockSize - 1) / blockSize;
+
+    for (int i = 1; i <= Nt; i++) {
+        double left_send = (rank > 0) ? u_prev[1] : 0.0;
+        double right_send = (rank < size - 1) ? u_prev[local_Nx - 1] : 0.0;
+        double left_recv = 0.0, right_recv = 0.0;
+
+        MPI_Request reqs[4];
+        int num_requests = 0;
+
+        if (rank > 0) {
+            MPI_Isend(&left_send, 1, MPI_DOUBLE, rank - 1, 0, MPI_COMM_WORLD, &reqs[num_requests++]);
+            MPI_Irecv(&left_recv, 1, MPI_DOUBLE, rank - 1, 0, MPI_COMM_WORLD, &reqs[num_requests++]);
+        }
+        if (rank < size - 1) {
+            MPI_Isend(&right_send, 1, MPI_DOUBLE, rank + 1, 0, MPI_COMM_WORLD, &reqs[num_requests++]);
+            MPI_Irecv(&right_recv, 1, MPI_DOUBLE, rank + 1, 0, MPI_COMM_WORLD, &reqs[num_requests++]);
+        }
+
+        if (num_requests > 0) {
+            MPI_Waitall(num_requests, reqs, MPI_STATUSES_IGNORE);
+        }
+
+        if (rank > 0) u_prev[0] = left_recv;
+        if (rank < size - 1) u_prev[local_Nx] = right_recv;
+
+        cudaStatus = cudaMemcpy(d_u_prev, u_prev.data(), (local_Nx + 1) * sizeof(double), cudaMemcpyHostToDevice);
+        if (cudaStatus != cudaSuccess) {
+            cerr << "Rank " << rank << " - cudaMemcpy failed before kernel: " << cudaGetErrorString(cudaStatus) << endl;
+            break;
+        }
+
+        heat_equation_kernel << <numBlocks, blockSize >> > (d_u_prev, d_u_curr, r, local_Nx, offset);
+        cudaStatus = cudaGetLastError();
+        if (cudaStatus != cudaSuccess) {
+            cerr << "Rank " << rank << " - Kernel launch failed: " << cudaGetErrorString(cudaStatus) << endl;
+            break;
+        }
+        cudaDeviceSynchronize();
+
+        double* temp = d_u_prev;
+        d_u_prev = d_u_curr;
+        d_u_curr = temp;
+
+        cudaStatus = cudaMemcpy(u_curr.data(), d_u_prev, (local_Nx + 1) * sizeof(double), cudaMemcpyDeviceToHost);
+        if (cudaStatus != cudaSuccess) {
+            cerr << "Rank " << rank << " - cudaMemcpy failed after kernel: " << cudaGetErrorString(cudaStatus) << endl;
+            break;
+        }
+
+        if (offset == 0) u_curr[0] = 0;
+        if (offset + local_Nx == Nx) u_curr[local_Nx] = 0;
+
+        u_prev = u_curr;
+    }
+
+    auto end = high_resolution_clock::now();
+    duration<double> elapsed = end - start;
+
+
+    
+    double max_elapsed = 0.0;
+    double elapsed_time = elapsed.count();
+    MPI_Reduce(&elapsed_time, &max_elapsed, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        cout << "Computation Time (MPI+CUDA): " << max_elapsed << " seconds" << endl;
+    }
+
+   
+    if (rank == 0) {
+        ofstream output_file("execution_times_mpi_cuda.csv", ios::app);
+        if (output_file.is_open()) {
+            if (output_file.tellp() == 0) {
+                output_file << "Rank,Time(s),Nx,Lx,Lt,r,BlockSize,NumBlocks,NumProcesses\n";
+            }
+            output_file << rank << "," << max_elapsed << "," << Nx << "," << Lx << "," << Lt << ","
+                << r << "," << blockSize << "," << numBlocks << "," << size << "\n";
+            output_file.close();
+            cout << "Execution time saved to execution_times_mpi_cuda.csv" << endl;
+        }
+        else {
+            cerr << "Error opening execution_times_mpi_cuda.csv!" << endl;
+        }
+    }
+
+    cudaFree(d_u_prev);
+    cudaFree(d_u_curr);
+
+ 
+    vector<double> exact(local_Nx + 1, 0.0);
+    vector<double> errors(local_Nx + 1, 0.0);
+    double t_final = Nt * dt;
+    for (int j = 0; j <= local_Nx; j++) {
+        double x = (offset + j) * dx;
+        double ex = exact_solution(x, t_final);
+        exact[j] = ex;
+        errors[j] = u_curr[j] - ex;
+    }
+
+    /*print_table(u_curr, "Numerical Solution (MPI+CUDA) at Final Time Step", rank, local_Nx);
+    print_table(exact, "Exact Solution at Final Time Step", rank, local_Nx);
+    print_table(errors, "Error at Final Time Step", rank, local_Nx);*/
+
+    MPI_Finalize();
+    return 0;
+}
