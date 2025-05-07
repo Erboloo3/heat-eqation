@@ -1,0 +1,185 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <iomanip>
+#include <chrono>
+#include <fstream>
+#include <string>
+#include <cuda_runtime.h>
+#include "device_launch_parameters.h"
+
+constexpr double M_PI = 3.14159265358979323846;
+
+using namespace std;
+using namespace std::chrono;
+
+
+constexpr double Lx = 1.0;
+constexpr double Ly = 1.0;
+constexpr double alpha = 1.0;
+constexpr double T = 0.1;
+
+
+__global__ void update_kernel(double* u_old, double* u_new, int Nx, int Ny, double r) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i > 0 && i < Nx - 1 && j > 0 && j < Ny - 1) {  
+        long long idx = static_cast<long long>(i) * Ny + j;
+        long long idx_left = static_cast<long long>(i - 1) * Ny + j;
+        long long idx_right = static_cast<long long>(i + 1) * Ny + j;
+        long long idx_down = static_cast<long long>(i) * Ny + (j - 1);
+        long long idx_up = static_cast<long long>(i) * Ny + (j + 1);
+
+        u_new[idx] = u_old[idx] + r * (u_old[idx_left] + u_old[idx_right] +
+            u_old[idx_down] + u_old[idx_up] - 4.0 * u_old[idx]);
+    }
+}
+
+
+static void checkCudaError(cudaError_t err, const char* msg) {
+    if (err != cudaSuccess) {
+        cerr << "CUDA Error: " << msg << " " << cudaGetErrorString(err) << endl;
+        exit(1);
+    }
+}
+
+
+static string get_gpu_name() {
+    cudaDeviceProp deviceProp;
+    cudaGetDeviceProperties(&deviceProp, 0);
+    return string(deviceProp.name);
+}
+
+
+static void save_time_to_csv(int run_id, double total_time, int Nx, int Ny, double Lx, double Lt, double r, int block_size, int num_blocks) {
+    string filename = "computation_times2D_cuda_Nx" + to_string(Nx) + "_Ny" + to_string(Ny) + ".csv";
+    ofstream file(filename);
+    if (!file) {
+        cerr << "Error opening " << filename << " for writing!" << endl;
+        return;
+    }
+
+   
+    string gpu_name = get_gpu_name();
+
+   
+    file << "RunID,Time(s),Nx,Lx,Lt,r,BlockSize,NumBlock,GPU\n";
+
+  
+    file << run_id << "," << fixed << setprecision(5) << total_time << ","
+        << Nx << "," << Lx << "," << Lt << "," << r << ","
+        << block_size << "," << num_blocks << "," << gpu_name << "\n";
+
+    file.close();
+    cout << "Time data saved to " << filename << endl;
+}
+
+
+static void run_test(int run_id, int Nx, int Ny) {
+   
+    double h = Lx / (Nx - 1);
+    double dt = 0.25 * h * h / alpha;
+    int Nt = static_cast<int>(T / dt);
+    double r = alpha * dt / (h * h);
+
+    if (r > 0.25) {
+        cerr << "Error: Stability condition not met (r <= 0.25). r = " << r << endl;
+        return;
+    }
+
+  
+    long long grid_size = static_cast<long long>(Nx) * Ny; 
+
+  
+    vector<double> u_host(grid_size, 0.0);  
+
+   
+    for (int i = 0; i < Nx; i++) {
+        double x = i * h;
+        for (int j = 0; j < Ny; j++) {
+            double y = j * h;
+            long long idx = static_cast<long long>(i) * Ny + j;
+            u_host[idx] = x * (1 - x) * y * (1 - y);
+        }
+    }
+
+   
+    for (int i = 0; i < Nx; i++) {
+        u_host[i * Ny + 0] = 0.0;         // y = 0
+        u_host[i * Ny + (Ny - 1)] = 0.0;  // y = Ly
+    }
+    for (int j = 0; j < Ny; j++) {
+        u_host[0 * Ny + j] = 0.0;         // x = 0
+        u_host[(Nx - 1) * Ny + j] = 0.0;  // x = Lx
+    }
+
+
+    double* d_u_old, * d_u_new;
+    checkCudaError(cudaMalloc((void**)&d_u_old, grid_size * sizeof(double)), "Allocating d_u_old");
+    checkCudaError(cudaMalloc((void**)&d_u_new, grid_size * sizeof(double)), "Allocating d_u_new");
+
+  
+    checkCudaError(cudaMemcpy(d_u_old, u_host.data(), grid_size * sizeof(double), cudaMemcpyHostToDevice),
+        "Copying initial condition to device");
+
+   
+    int block_size = 16; 
+    dim3 blockDim(block_size, block_size);
+    dim3 gridDim((Nx + blockDim.x - 1) / blockDim.x, (Ny + blockDim.y - 1) / blockDim.y);
+    int num_blocks = gridDim.x * gridDim.y;
+
+    
+    auto total_start = high_resolution_clock::now();
+
+   
+    for (int k = 0; k < Nt; k++) {
+        
+        update_kernel << <gridDim, blockDim >> > (d_u_old, d_u_new, Nx, Ny, r);
+        checkCudaError(cudaGetLastError(), "Kernel launch failed");
+        cudaDeviceSynchronize();
+
+        
+        double* temp = d_u_old;
+        d_u_old = d_u_new;
+        d_u_new = temp;
+    }
+
+    auto total_end = high_resolution_clock::now();
+    duration<double> total_duration = total_end - total_start;
+
+  
+    cout << "RunID = " << run_id << ", Nx = " << Nx << ", Ny = " << Ny << ", Total computation time: " << total_duration.count() << " seconds" << endl;
+
+    
+    save_time_to_csv(run_id, total_duration.count(), Nx, Ny, Lx, T, r, block_size * block_size, num_blocks);
+
+   
+    cudaFree(d_u_old);
+    cudaFree(d_u_new);
+}
+
+int main() {
+   
+    int deviceCount = 0;
+    cudaGetDeviceCount(&deviceCount);
+    if (deviceCount == 0) {
+        cerr << "No CUDA devices found!" << endl;
+        return 1;
+    }
+    cout << "Number of CUDA devices: " << deviceCount << endl;
+
+    
+    int sizes[] = { 100, 200, 300, 400, 500 };
+    int num_tests = sizeof(sizes) / sizeof(sizes[0]);
+
+   
+    for (int i = 0; i < num_tests; i++) {
+        int Nx = sizes[i];
+        int Ny = sizes[i];
+        cout << "Running test with Nx = " << Nx << ", Ny = " << Ny << endl;
+        run_test(i + 1, Nx, Ny); 
+    }
+
+    return 0;
+}
