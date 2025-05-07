@@ -1,0 +1,255 @@
+﻿#include <iostream>
+#include <vector>
+#include <cmath>
+#include <iomanip>
+#include <chrono>
+#include <mpi.h>
+#include <fstream>
+#include <string>
+#include <cuda_runtime.h>
+#include "device_launch_parameters.h"
+
+constexpr double M_PI = 3.14159265358979323846;
+
+using namespace std;
+using namespace std::chrono;
+
+
+constexpr double Lx = 1.0;
+constexpr double Ly = 1.0;
+constexpr double alpha = 1.0;
+constexpr double T = 0.1;
+
+
+__global__ void update_kernel(double* u_old, double* u_new, int local_Nx, int Ny, double r) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x + 1; 
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (i <= local_Nx && j < Ny) { 
+        int idx = i * (Ny + 1) + j;
+        int idx_left = (i - 1) * (Ny + 1) + j;
+        int idx_right = (i + 1) * (Ny + 1) + j;
+        int idx_down = i * (Ny + 1) + (j - 1);
+        int idx_up = i * (Ny + 1) + (j + 1);
+
+        u_new[idx] = u_old[idx] + r * (u_old[idx_left] + u_old[idx_right] +
+            u_old[idx_down] + u_old[idx_up] - 4.0 * u_old[idx]);
+    }
+}
+
+
+static void checkCudaError(cudaError_t err, const char* msg, int rank) {
+    if (err != cudaSuccess) {
+        cerr << "Rank " << rank << " - CUDA Error: " << msg << " " << cudaGetErrorString(err) << endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+}
+
+
+static void save_time_to_csv(const vector<double>& time_steps, int Nx, int Ny, int rank, double total_time) {
+    string filename = "computation_times2D_cuda_mpi_rank" + to_string(rank) + "_Nx" + to_string(Nx) + "_Ny" + to_string(Ny) + ".csv";
+    ofstream file(filename);
+    if (!file) {
+        cerr << "Rank " << rank << " - Error opening " << filename << " for writing!" << endl;
+        return;
+    }
+    file << "Time Step,Computation Time (seconds)\n";
+    for (size_t k = 0; k < time_steps.size(); k++) {
+        file << k + 1 << "," << fixed << setprecision(6) << time_steps[k] << "\n";
+    }
+    file << "Total Time," << total_time << "\n";
+    file.close();
+    cout << "Rank " << rank << " - Time data saved to " << filename << endl;
+}
+
+static void run_test(int Nx, int Ny, int rank, int size) {
+    
+    int deviceCount = 0;
+    checkCudaError(cudaGetDeviceCount(&deviceCount), "Getting device count", rank);
+    if (deviceCount == 0) {
+        cerr << "Rank " << rank << " - No CUDA devices found!" << endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    checkCudaError(cudaSetDevice(rank % deviceCount), "Setting CUDA device", rank);
+
+ 
+    double h = Lx / (Nx - 1);
+    double dt = 0.25 * h * h / alpha;
+    int Nt = static_cast<int>(T / dt);
+    double r = alpha * dt / (h * h);
+
+    if (r > 0.25 && rank == 0) {
+        cerr << "Error: Stability condition not met (r <= 0.25). r = " << r << endl;
+        MPI_Barrier(MPI_COMM_WORLD);
+        return;
+    }
+
+   
+    int local_Nx = Nx / size;
+    int remainder = Nx % size;
+    int x_offset = rank * local_Nx + min(rank, remainder);
+    if (rank < remainder) local_Nx++;
+
+   
+    long long local_size = static_cast<long long>(local_Nx + 2) * (Ny + 1);
+
+   
+    vector<double> u_host(local_size, 0.0); 
+    vector<double> time_steps(Nt, 0.0);     
+
+   
+    for (int i = 1; i <= local_Nx; i++) {
+        double x = (x_offset + i - 1) * h;
+        for (int j = 0; j <= Ny; j++) {
+            double y = j * h;
+            long long idx = static_cast<long long>(i) * (Ny + 1) + j;  
+            u_host[idx] = x * (1 - x) * y * (1 - y);
+        }
+    }
+
+    
+    if (x_offset == 0) {
+        for (int j = 0; j <= Ny; j++) {
+            u_host[0 * (Ny + 1) + j] = 0.0;
+        }
+    }
+    if (x_offset + local_Nx == Nx) {
+        for (int j = 0; j <= Ny; j++) {
+            long long idx = static_cast<long long>(local_Nx + 1) * (Ny + 1) + j;
+            u_host[idx] = 0.0;
+        }
+    }
+    for (int i = 0; i <= local_Nx + 1; i++) {
+        long long idx_bottom = static_cast<long long>(i) * (Ny + 1) + 0;
+        long long idx_top = static_cast<long long>(i) * (Ny + 1) + Ny;
+        u_host[idx_bottom] = 0.0;
+        u_host[idx_top] = 0.0;
+    }
+
+    double* d_u_old, * d_u_new;
+    checkCudaError(cudaMalloc((void**)&d_u_old, local_size * sizeof(double)), "Allocating d_u_old", rank);
+    checkCudaError(cudaMalloc((void**)&d_u_new, local_size * sizeof(double)), "Allocating d_u_new", rank);
+
+    
+    checkCudaError(cudaMemcpy(d_u_old, u_host.data(), local_size * sizeof(double), cudaMemcpyHostToDevice),
+        "Copying initial condition to device", rank);
+
+ 
+    dim3 blockDim(16, 16);
+    dim3 gridDim((local_Nx + blockDim.x - 1) / blockDim.x, (Ny + blockDim.y - 1) / blockDim.y);
+
+  
+    auto total_start = high_resolution_clock::now();
+
+   
+    for (int k = 0; k < Nt; k++) {
+        auto step_start = high_resolution_clock::now();
+
+      
+        vector<double> left_send(Ny + 1, 0.0);
+        vector<double> right_send(Ny + 1, 0.0);
+        vector<double> left_recv(Ny + 1, 0.0);
+        vector<double> right_recv(Ny + 1, 0.0);
+
+       
+        if (rank > 0) {
+            checkCudaError(cudaMemcpy(left_send.data(), d_u_old + 1 * (Ny + 1), (Ny + 1) * sizeof(double), cudaMemcpyDeviceToHost),
+                "Copying left boundary from device", rank);
+        }
+        if (rank < size - 1) {
+            checkCudaError(cudaMemcpy(right_send.data(), d_u_old + local_Nx * (Ny + 1), (Ny + 1) * sizeof(double), cudaMemcpyDeviceToHost),
+                "Copying right boundary from device", rank);
+        }
+
+      
+        MPI_Request reqs[4] = { MPI_REQUEST_NULL, MPI_REQUEST_NULL, MPI_REQUEST_NULL, MPI_REQUEST_NULL };  
+        int num_requests = 0;
+        if (rank > 0) {
+            MPI_Isend(left_send.data(), Ny + 1, MPI_DOUBLE, rank - 1, 0, MPI_COMM_WORLD, &reqs[num_requests++]);
+            MPI_Irecv(left_recv.data(), Ny + 1, MPI_DOUBLE, rank - 1, 0, MPI_COMM_WORLD, &reqs[num_requests++]);
+        }
+        if (rank < size - 1) {
+            MPI_Isend(right_send.data(), Ny + 1, MPI_DOUBLE, rank + 1, 0, MPI_COMM_WORLD, &reqs[num_requests++]);
+            MPI_Irecv(right_recv.data(), Ny + 1, MPI_DOUBLE, rank + 1, 0, MPI_COMM_WORLD, &reqs[num_requests++]);
+        }
+        if (num_requests > 0) {
+            MPI_Waitall(num_requests, reqs, MPI_STATUSES_IGNORE);
+        }
+
+      
+        if (rank > 0) {
+            checkCudaError(cudaMemcpy(d_u_old, left_recv.data(), (Ny + 1) * sizeof(double), cudaMemcpyHostToDevice),
+                "Copying left ghost to device", rank);
+        }
+        if (rank < size - 1) {
+            checkCudaError(cudaMemcpy(d_u_old + (local_Nx + 1) * (Ny + 1), right_recv.data(), (Ny + 1) * sizeof(double), cudaMemcpyHostToDevice),
+                "Copying right ghost to device", rank);
+        }
+
+       
+        update_kernel << <gridDim, blockDim >> > (d_u_old, d_u_new, local_Nx, Ny, r);
+        checkCudaError(cudaGetLastError(), "Kernel launch failed", rank);
+        cudaDeviceSynchronize();
+
+        
+        double* temp = d_u_old;
+        d_u_old = d_u_new;
+        d_u_new = temp;
+
+        
+        auto step_end = high_resolution_clock::now();
+        duration<double> step_duration = step_end - step_start;
+        time_steps[k] = step_duration.count();
+    }
+
+    auto total_end = high_resolution_clock::now();
+    duration<double> total_duration = total_end - total_start;
+
+  
+    cout << "Rank " << rank << " - Nx = " << Nx << ", Ny = " << Ny << ", Total computation time: " << total_duration.count() << " seconds" << endl;
+
+  
+    save_time_to_csv(time_steps, Nx, Ny, rank, total_duration.count());
+
+   
+    cudaFree(d_u_old);
+    cudaFree(d_u_new);
+}
+
+int main(int argc, char** argv) {
+   
+    MPI_Init(&argc, &argv);
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    
+    int deviceCount = 0;
+    cudaGetDeviceCount(&deviceCount);
+    if (deviceCount == 0) {
+        cerr << "Rank " << rank << " - No CUDA devices found!" << endl;
+        MPI_Finalize();
+        return 1;
+    }
+    if (rank == 0) {
+        cout << "Number of CUDA devices: " << deviceCount << endl;
+    }
+
+    
+    int sizes[] = { 100, 200, 300, 400, 500 };
+    int num_tests = sizeof(sizes) / sizeof(sizes[0]);
+
+    
+    for (int i = 0; i < num_tests; i++) {
+        int Nx = sizes[i];
+        int Ny = sizes[i];
+        if (rank == 0) {
+            cout << "Running test with Nx = " << Nx << ", Ny = " << Ny << endl;
+        }
+        run_test(Nx, Ny, rank, size);
+        MPI_Barrier(MPI_COMM_WORLD);  
+    }
+
+    MPI_Finalize();
+    return 0;
+}
