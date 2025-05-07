@@ -1,0 +1,122 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <iomanip>
+#include <chrono>
+#include <cuda_runtime.h>
+#include "device_launch_parameters.h"
+#include <fstream>
+
+#define M_PI 3.14159265358979323846
+
+using namespace std;
+using namespace std::chrono;
+
+double exact_solution(double x, double t) {
+    double sum = 0.0;
+    for (int n = 1; n <= 1; n++) {
+        sum += (1.0 / pow(n * M_PI, 3)) * sin(n * M_PI * x) * exp(-pow(n * M_PI, 2) * t);
+    }
+    return 8.0 * sum;
+}
+
+__global__ void heat_equation_kernel(double* u_prev, double* u_curr, double r, int Nx) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j > 0 && j < Nx) {
+        u_curr[j] = u_prev[j] + r * (u_prev[j - 1] - 2.0 * u_prev[j] + u_prev[j + 1]);
+    }
+}
+
+int main() {
+    int Nx = 100000;  
+    double Lx = 100.0;
+    double Lt = 0.025;  
+    double r = 0.5;    
+    double dx = Lx / Nx;
+    double dt = r * dx * dx;  
+    int Nt = Lt / dt;         
+
+    if (r > 0.5) {
+        cerr << "Error: Stability condition not met (r <= 0.5)." << endl;
+        return 1;
+    }
+
+    cout << "Nx: " << Nx << ", Nt: " << Nt << ", dx: " << dx << ", dt: " << dt << ", r: " << r << endl;
+
+    
+    vector<double> u_initial(Nx + 1, 0.0);
+    vector<double> u_final(Nx + 1, 0.0);
+
+   
+    for (int j = 0; j <= Nx; j++) {
+        double x = j * dx;
+        u_initial[j] = x * (1 - x);
+    }
+    u_initial[0] = 0.0;
+    u_initial[Nx] = 0.0;
+
+    
+    double* d_u_prev, * d_u_curr;
+    cudaMalloc((void**)&d_u_prev, (Nx + 1) * sizeof(double));
+    cudaMalloc((void**)&d_u_curr, (Nx + 1) * sizeof(double));
+
+    
+    cudaMemcpy(d_u_prev, u_initial.data(), (Nx + 1) * sizeof(double), cudaMemcpyHostToDevice);
+
+    auto start = high_resolution_clock::now();
+
+    
+    int blockSize = 256;
+    int numBlocks = (Nx + blockSize - 1) / blockSize;
+
+    
+    for (int i = 1; i <= Nt; i++) {
+        heat_equation_kernel << <numBlocks, blockSize >> > (d_u_prev, d_u_curr, r, Nx);
+        cudaDeviceSynchronize();
+
+        double* temp = d_u_prev;
+        d_u_prev = d_u_curr;
+        d_u_curr = temp;
+    }
+
+   
+    cudaMemcpy(u_final.data(), d_u_prev, (Nx + 1) * sizeof(double), cudaMemcpyDeviceToHost);
+
+    auto end = high_resolution_clock::now();
+    duration<double> elapsed = end - start;
+    cout << "Computation Time (CUDA): " << elapsed.count() << " seconds" << endl;
+
+   
+    ofstream output_file("execution_times_cuda.csv", ios::app);
+    if (output_file.is_open()) {
+        if (output_file.tellp() == 0) {
+            output_file << "Process,Time,Nx\n";
+        }
+        output_file << 1 << "," << elapsed.count() << "," << Nx << "\n";  
+        output_file.close();
+        cout << "Execution time saved to execution_times_cuda.csv" << endl;
+    }
+    else {
+        cerr << "Error opening execution_times_cuda.csv!" << endl;
+    }
+
+   
+    cudaFree(d_u_prev);
+    cudaFree(d_u_curr);
+
+    
+    vector<double> exact_final(Nx + 1, 0.0);
+    vector<double> errors_final(Nx + 1, 0.0);
+    double t_final = Nt * dt;
+    for (int j = 0; j <= Nx; j++) {
+        double x = j * dx;
+        double ex = exact_solution(x, t_final);
+        exact_final[j] = ex;
+        errors_final[j] = u_final[j] - ex;
+    }
+
+    
+    cout << "Last time step data collected successfully." << endl;
+
+    return 0;
+}
