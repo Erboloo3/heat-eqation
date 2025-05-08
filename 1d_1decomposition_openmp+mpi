@@ -1,0 +1,204 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <iomanip>
+#include <mpi.h>
+#include <chrono>
+#include <algorithm>
+#include <omp.h>
+
+using namespace std;
+using namespace std::chrono;
+
+constexpr double PI = 3.14159265358979323846;
+
+inline double exact_solution(double x, double t) {
+    double sum = 0.0;
+    for (int n = 1; n <= 1; ++n) {
+        sum += (1.0 / pow(n * PI, 3)) * sin(n * PI * x) * exp(-pow(n * PI, 2) * t);
+    }
+    return 8 * sum;
+}
+
+void print_table(const vector<vector<double>>& table, const string& title, int rank) {
+    cout << "\nProcess " << rank << " - " << title << ":\n";
+    cout << "--------------------------------------------------\n";
+    int rows = min((int)table.size(), 10);
+    for (int i = 0; i < rows; i++) {
+        cout << "Row " << i << " | ";
+        int cols = min((int)table[i].size(), 10);
+        for (int j = 0; j < cols; j++) {
+            cout << setw(8) << fixed << setprecision(3) << table[i][j] << " ";
+        }
+        cout << "\n";
+    }
+    cout << "--------------------------------------------------\n";
+}
+
+int main(int argc, char** argv) {
+    MPI_Init(&argc, &argv);
+
+    int rank, size;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &size);
+
+    double Lx = 100;
+    double Lt = 0.025;
+    int Nx = 1000;  // Для отладки уменьшен размер Nx
+    double dx = Lx / Nx;
+    double r = 0.5;
+    double dt = 0.5 * (dx * dx);
+    int Nt = Lt / dt;
+
+    if (r > 0.5) {
+        cerr << "Error: Stability condition not met (r <= 0.5)." << endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    int total_points = Nx + 1;
+    int base = total_points / size;
+    int rem = total_points % size;
+    int local_N, local_start;
+
+    if (rank < rem) {
+        local_N = base + 1;
+        local_start = rank * local_N;
+    }
+    else {
+        local_N = base;
+        local_start = rank * local_N + rem;
+    }
+    int local_end = local_start + local_N - 1;
+
+    vector<double> u_prev(local_N + 2, 0.0);  // Храним только два слоя
+    vector<double> u_curr(local_N + 2, 0.0);
+
+    // Инициализация
+#pragma omp parallel for
+    for (int j = 1; j <= local_N; j++) {
+        int global_j = local_start + j - 1;
+        double x = global_j * dx;
+        u_curr[j] = x * (1 - x);
+    }
+
+    if (local_start == 0) u_curr[1] = 0.0;
+    if (local_end == Nx) u_curr[local_N] = 0.0;
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    auto start_time = high_resolution_clock::now();
+
+    // Временной шаг
+    for (int i = 1; i <= Nt; i++) {
+        // Границами обменяться
+        if (rank > 0) {
+            double send_val = u_curr[1], recv_val;
+            MPI_Sendrecv(&send_val, 1, MPI_DOUBLE, rank - 1, 0,
+                &recv_val, 1, MPI_DOUBLE, rank - 1, 1,
+                MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            u_prev[0] = recv_val;
+        }
+
+        if (rank < size - 1) {
+            double send_val = u_curr[local_N], recv_val;
+            MPI_Sendrecv(&send_val, 1, MPI_DOUBLE, rank + 1, 1,
+                &recv_val, 1, MPI_DOUBLE, rank + 1, 0,
+                MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            u_prev[local_N + 1] = recv_val;
+        }
+
+        // Обновление значений с использованием OpenMP
+#pragma omp parallel for
+        for (int j = 1; j <= local_N; j++) {
+            int global_j = local_start + j - 1;
+            if (global_j == 0 || global_j == Nx) {
+                u_curr[j] = 0.0;
+            }
+            else {
+                u_curr[j] = u_prev[j] +
+                    r * (u_prev[j - 1] - 2 * u_prev[j] + u_prev[j + 1]);
+            }
+        }
+
+        // Обмен данных для следующего временного шага
+        swap(u_prev, u_curr);
+    }
+
+    auto end_time = high_resolution_clock::now();
+    duration<double> local_elapsed = end_time - start_time;
+    double local_time = local_elapsed.count();
+    double global_time;
+    MPI_Reduce(&local_time, &global_time, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        cout << "Processes: " << size << ", Time: " << global_time << " seconds\n";
+    }
+
+    // Exact solution and error
+    vector<vector<double>> exact_local(Nt + 1, vector<double>(local_N + 2, 0.0));
+    vector<vector<double>> error_local(Nt + 1, vector<double>(local_N + 2, 0.0));
+
+#pragma omp parallel for collapse(2)
+    for (int i = 0; i <= Nt; i++) {
+        for (int j = 1; j <= local_N; j++) {
+            int global_j = local_start + j - 1;
+            double x = global_j * dx;
+            double t = i * dt;
+            double ex = exact_solution(x, t);
+            exact_local[i][j] = ex;
+            error_local[i][j] = u_curr[j] - ex;
+        }
+    }
+
+    vector<vector<double>> u_global, exact_global, error_global;
+    if (rank == 0) {
+        u_global.resize(Nt + 1, vector<double>(total_points));
+        exact_global.resize(Nt + 1, vector<double>(total_points));
+        error_global.resize(Nt + 1, vector<double>(total_points));
+    }
+
+    vector<int> recvcounts(size), displs(size);
+    int offset = 0;
+    for (int p = 0; p < size; p++) {
+        int points_p = (p < rem ? base + 1 : base);
+        recvcounts[p] = points_p;
+        displs[p] = offset;
+        offset += points_p;
+    }
+
+    vector<double> send_buffer(local_N);
+    for (int i = 0; i <= Nt; i++) {
+        for (int j = 0; j < local_N; j++) {
+            send_buffer[j] = u_curr[j + 1];
+        }
+        MPI_Gatherv(send_buffer.data(), local_N, MPI_DOUBLE,
+            (rank == 0 ? u_global[i].data() : nullptr),
+            recvcounts.data(), displs.data(), MPI_DOUBLE,
+            0, MPI_COMM_WORLD);
+
+        for (int j = 0; j < local_N; j++) {
+            send_buffer[j] = exact_local[i][j + 1];
+        }
+        MPI_Gatherv(send_buffer.data(), local_N, MPI_DOUBLE,
+            (rank == 0 ? exact_global[i].data() : nullptr),
+            recvcounts.data(), displs.data(), MPI_DOUBLE,
+            0, MPI_COMM_WORLD);
+
+        for (int j = 0; j < local_N; j++) {
+            send_buffer[j] = error_local[i][j + 1];
+        }
+        MPI_Gatherv(send_buffer.data(), local_N, MPI_DOUBLE,
+            (rank == 0 ? error_global[i].data() : nullptr),
+            recvcounts.data(), displs.data(), MPI_DOUBLE,
+            0, MPI_COMM_WORLD);
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (rank == 0) {
+        print_table(u_global, "Numerical Solution", rank);
+        print_table(exact_global, "Exact Solution", rank);
+        print_table(error_global, "Error", rank);
+    }
+
+    MPI_Finalize();
+    return 0;
+}
