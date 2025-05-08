@@ -1,0 +1,120 @@
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <iomanip>
+#include <chrono>
+#include <fstream>
+#include <string>
+
+constexpr double M_PI = 3.14159265358979323846;
+
+using namespace std;
+using namespace std::chrono;
+
+
+constexpr double Lx = 1.0;
+constexpr double Ly = 1.0;
+constexpr double alpha = 1.0;
+constexpr double T = 0.1;
+
+static void save_time_to_csv(const vector<double>& time_steps, int Nx, int Ny, double total_time) {
+    string filename = "computation_times2D_serial_Nx" + to_string(Nx) + "_Ny" + to_string(Ny) + ".csv";
+    ofstream file(filename);
+    if (!file) {
+        cerr << "Error opening " << filename << " for writing!" << endl;
+        return;
+    }
+    file << "Time Step,Computation Time (seconds)\n";
+    for (size_t k = 0; k < time_steps.size(); k++) {
+        file << k + 1 << "," << fixed << setprecision(6) << time_steps[k] << "\n";
+    }
+    file << "Total Time," << total_time << "\n";
+    file.close();
+    cout << "Time data saved to " << filename << endl;
+}
+
+
+static void run_test(int Nx, int Ny) {
+   
+    double h = Lx / (Nx - 1);
+    double dt = 0.25 * h * h / alpha;
+    int Nt = static_cast<int>(T / dt);
+    double r = alpha * dt / (h * h);
+
+    if (r > 0.25) {
+        cerr << "Error: Stability condition not met (r <= 0.25). r = " << r << endl;
+        return;
+    }
+
+    long long grid_size = static_cast<long long>(Nx) * Ny;
+
+    vector<double> u(grid_size, 0.0);
+    vector<double> u_new(grid_size, 0.0);
+    vector<double> time_steps(Nt, 0.0);
+
+    
+    for (int i = 0; i < Nx; i++) {
+        double x = i * h;
+        for (int j = 0; j < Ny; j++) {
+            double y = j * h;
+            long long idx = static_cast<long long>(i) * Ny + j;
+            u[idx] = x * (1 - x) * y * (1 - y);
+        }
+    }
+
+    
+    for (int i = 0; i < Nx; i++) {
+        u[i * Ny + 0] = 0.0;
+        u[i * Ny + (Ny - 1)] = 0.0;
+    }
+    for (int j = 0; j < Ny; j++) {
+        u[0 * Ny + j] = 0.0;
+        u[(Nx - 1) * Ny + j] = 0.0;
+    }
+
+    auto total_start = high_resolution_clock::now();
+
+    for (int k = 0; k < Nt; k++) {
+        auto step_start = high_resolution_clock::now();
+
+        for (int i = 1; i < Nx - 1; i++) {
+            for (int j = 1; j < Ny - 1; j++) {
+                long long idx = static_cast<long long>(i) * Ny + j;
+                long long idx_left = static_cast<long long>(i - 1) * Ny + j;
+                long long idx_right = static_cast<long long>(i + 1) * Ny + j;
+                long long idx_down = static_cast<long long>(i) * Ny + (j - 1);
+                long long idx_up = static_cast<long long>(i) * Ny + (j + 1);
+
+                u_new[idx] = u[idx] + r * (u[idx_left] + u[idx_right] + u[idx_down] + u[idx_up] - 4.0 * u[idx]);
+            }
+        }
+
+        u.swap(u_new);
+
+        auto step_end = high_resolution_clock::now();
+        duration<double> step_duration = step_end - step_start;
+        time_steps[k] = step_duration.count();
+    }
+
+    auto total_end = high_resolution_clock::now();
+    duration<double> total_duration = total_end - total_start;
+
+    cout << "Nx = " << Nx << ", Ny = " << Ny << ", Total computation time: " << total_duration.count() << " seconds" << endl;
+
+    save_time_to_csv(time_steps, Nx, Ny, total_duration.count());
+}
+
+int main() {
+ 
+    int sizes[] = { 100,200,300,400,500 };
+    int num_tests = sizeof(sizes) / sizeof(sizes[0]);
+
+    for (int i = 0; i < num_tests; i++) {
+        int Nx = sizes[i];
+        int Ny = sizes[i]; 
+        cout << "Running test with Nx = " << Nx << ", Ny = " << Ny << endl;
+        run_test(Nx, Ny);
+    }
+
+    return 0;
+}
