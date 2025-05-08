@@ -1,0 +1,121 @@
+
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <iomanip>
+#include <chrono>
+#include <fstream>
+
+#define M_PI 3.14159265358979323846
+
+using namespace std;
+using namespace std::chrono;
+
+
+double exact_solution(double x, double t) {
+    double sum = 0.0;
+    for (int n = 1; n <= 1; n++) {
+        sum += (1.0 / pow(n * M_PI, 3)) * sin(n * M_PI * x) * exp(-pow(n * M_PI, 2) * t);
+    }
+    return 8.0 * sum;
+}
+
+
+void save_to_csv(const vector<vector<double>>& table, const string& filename) {
+    ofstream file(filename);
+    if (!file.is_open()) {
+        cerr << "Error opening file: " << filename << endl;
+        return;
+    }
+
+    for (const auto& row : table) {
+        for (size_t j = 0; j < row.size(); j++) {
+            file << row[j];
+            if (j < row.size() - 1) file << ",";
+        }
+        file << "\n";
+    }
+    file.close();
+    cout << "Saved: " << filename << endl;
+}
+
+
+void save_computation_time(double computation_time, int Nx, const string& filename) {
+    ofstream file(filename, ios::app);
+    if (!file.is_open()) {
+        cerr << "Error opening file: " << filename << endl;
+        return;
+    }
+    file << "Nx" << "," << "Time" << "endl";
+    file << Nx << ", " << computation_time << "\n";
+    file.close();
+    cout << "Computation time appended to: " << filename << endl;
+}
+
+int main() {
+    int Nx = 5;
+    double Lx = 100;
+    double Lt = 0.03;
+    double r = 0.5;
+    double dx = Lx / Nx;
+    double dt = r * (dx * dx);
+    double alpha = 1.0;
+    int Nt = Lt / dt;
+    cout << "Nt= " << Nt << endl;
+
+    if (r > 0.5) {
+        cerr << "Error: Stability condition not met (r <= 0.5)." << endl;
+        return 1;
+    }
+
+    vector<vector<double>> u(Nt + 1, vector<double>(Nx + 1, 0.0));
+
+    // Initial condition: u(x,0) = x * (1 - x)
+    for (int j = 0; j <= Nx; j++) {
+        double x = j * dx;
+        u[0][j] = x * (1 - x);
+    }
+
+    // Boundary conditions: u(0,t) = 0 and u(Lx,t) = 0
+    for (int i = 0; i <= Nt; i++) {
+        u[i][0] = 0;
+        u[i][Nx] = 0;
+    }
+
+    auto start = high_resolution_clock::now();
+
+    for (int i = 1; i <= Nt; i++) {
+        for (int j = 1; j < Nx; j++) {
+            u[i][j] = u[i - 1][j] + r * (u[i - 1][j - 1] - 2 * u[i - 1][j] + u[i - 1][j + 1]);
+        }
+    }
+
+    auto end = high_resolution_clock::now(); 
+    duration<double> elapsed = end - start;
+    double computation_time = elapsed.count();
+    cout << "Computation Time (core calculations only): " << computation_time << " seconds" << endl;
+
+
+    vector<vector<double>> exact(Nt + 1, vector<double>(Nx + 1, 0.0));
+    vector<vector<double>> errors(Nt + 1, vector<double>(Nx + 1, 0.0));
+
+    for (int i = 0; i <= Nt; i++) {
+        for (int j = 0; j <= Nx; j++) {
+            double x = j * dx;
+            double t = i * dt;
+            double ex = exact_solution(x, t);
+            exact[i][j] = ex;
+            errors[i][j] = u[i][j] - ex;
+        }
+    }
+
+    // Save data to CSV
+    /*save_to_csv(u, "numerical_solution.csv");
+    save_to_csv(exact, "exact_solution.csv");
+    save_to_csv(errors, "error_distribution.csv");*/
+
+    // Append computation time and Nx separately
+    save_computation_time(computation_time, Nx, "computation_time.txt");
+
+    return 0;
+}
